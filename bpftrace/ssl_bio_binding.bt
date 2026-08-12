@@ -1,0 +1,108 @@
+#!/usr/bin/env bpftrace
+/*
+ * Optional, lower-dependency evidence for the same defect. Does not involve
+ * OBI at all.
+ *
+ * The claim under test: for a memory-BIO TLS stack, the SSL_write that encrypts
+ * the plaintext and the socket syscall that puts the resulting ciphertext on the
+ * wire happen on DIFFERENT call stacks. Any instrumentation that tries to bind
+ * an SSL* to a socket by watching for a socket syscall *during* the SSL_write
+ * uprobe will therefore find nothing and have to guess.
+ *
+ * What this script prints, per thread:
+ *   SSL_set_bio  -- the SSL* being wired to its BIOs at handshake setup. For a
+ *                   memory BIO the rbio/wbio are heap buffers, not an fd.
+ *   SSL_write    -- entry/exit brackets around the encryption call.
+ *   BIO_write    -- ciphertext movement (NOTE: BIO_read/BIO_write are exported
+ *                   by libcrypto, NOT libssl).
+ *   sendto/write -- the actual socket syscall.
+ *
+ * READ THE OUTPUT FOR ORDERING, not for volume. The signature of the bug is
+ * that the sendto/sendmsg for a given payload appears AFTER "SSL_write exit"
+ * rather than between "SSL_write enter" and "SSL_write exit".
+ *
+ * Requires: Linux host, root, bpftrace, and the target process's libssl path.
+ * See bpftrace/README.md for how to run this against the `app` container.
+ */
+
+BEGIN
+{
+  printf("tracing pid %d -- ordering of SSL_write vs socket syscalls\n", $1);
+  printf("%-18s %-6s %-16s %s\n", "TIME(ms)", "TID", "EVENT", "DETAIL");
+}
+
+uprobe:LIBSSL:SSL_set_bio /pid == $1/
+{
+  printf("%-18llu %-6d %-16s ssl=%p rbio=%p wbio=%p\n",
+         nsecs / 1000000, tid, "SSL_set_bio", arg0, arg1, arg2);
+}
+
+/* CPython's _ssl module calls SSL_write_ex, not SSL_write. Both are probed:
+ * whichever the runtime uses, the sandwich window is measured the same way. */
+uprobe:LIBSSL:SSL_write /pid == $1/
+{
+  @in_write[tid] = 1;
+  @wrote[tid] = 0;
+  printf("%-18llu %-6d %-16s ssl=%p len=%d\n",
+         nsecs / 1000000, tid, "SSL_write>", arg0, arg2);
+}
+
+uretprobe:LIBSSL:SSL_write /pid == $1/
+{
+  printf("%-18llu %-6d %-16s ret=%d socket_syscalls_inside_window=%d\n",
+         nsecs / 1000000, tid, "SSL_write<", retval, @wrote[tid]);
+  /* This counter is the whole point. Socket BIO => 1 or more. Memory BIO => 0,
+     which is the empty "sandwich" that forces the instrumentation to guess. */
+  @syscalls_inside_ssl_write = hist(@wrote[tid]);
+  delete(@in_write[tid]);
+  delete(@wrote[tid]);
+}
+
+uprobe:LIBSSL:SSL_write_ex /pid == $1/
+{
+  @in_write[tid] = 1;
+  @wrote[tid] = 0;
+  printf("%-18llu %-6d %-16s ssl=%p len=%d\n",
+         nsecs / 1000000, tid, "SSL_write_ex>", arg0, arg2);
+}
+
+uretprobe:LIBSSL:SSL_write_ex /pid == $1/
+{
+  printf("%-18llu %-6d %-16s ret=%d socket_syscalls_inside_window=%d\n",
+         nsecs / 1000000, tid, "SSL_write_ex<", retval, @wrote[tid]);
+  @syscalls_inside_ssl_write = hist(@wrote[tid]);
+  delete(@in_write[tid]);
+  delete(@wrote[tid]);
+}
+
+uprobe:LIBCRYPTO:BIO_write /pid == $1/
+{
+  printf("%-18llu %-6d %-16s bio=%p len=%d in_ssl_write=%d\n",
+         nsecs / 1000000, tid, "BIO_write", arg0, arg2,
+         @in_write[tid] != 0 ? 1 : 0);
+}
+
+tracepoint:syscalls:sys_enter_sendto /pid == $1/
+{
+  if (@in_write[tid] != 0) {
+    @wrote[tid] = @wrote[tid] + 1;
+  }
+  printf("%-18llu %-6d %-16s fd=%d len=%d INSIDE_SSL_WRITE=%s\n",
+         nsecs / 1000000, tid, "sys_sendto", args.fd, args.len,
+         @in_write[tid] != 0 ? "yes" : "NO  <-- unbindable");
+}
+
+tracepoint:syscalls:sys_enter_write /pid == $1/
+{
+  if (@in_write[tid] != 0) {
+    @wrote[tid] = @wrote[tid] + 1;
+  }
+}
+
+END
+{
+  clear(@in_write);
+  clear(@wrote);
+  printf("\nhistogram: socket syscalls observed INSIDE each SSL_write window.\n");
+  printf("A memory-BIO stack piles up at 0 -- that is the defect.\n");
+}

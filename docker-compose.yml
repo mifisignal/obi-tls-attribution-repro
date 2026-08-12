@@ -1,0 +1,73 @@
+# Reproduction for OBI issue #2998 -- TLS client spans attributed to the wrong
+# socket when the application uses a memory-BIO TLS stack.
+#
+#   upstream : TLS server. The CORRECT peer of app's outbound call.
+#   app      : CPython asyncio service. Inbound HTTP :8080, outbound TLS to upstream.
+#   loadgen  : concurrent inbound load. CONCURRENCY matters -- see README.
+#   obi      : the instrumentation under test, printing spans as JSON to stdout.
+#
+# Run:  docker compose up --build
+# Read: docker compose logs -f obi
+
+services:
+  upstream:
+    build: ./upstream
+    container_name: obi-repro-upstream
+    expose:
+      - "8443"
+
+  app:
+    build: ./app
+    container_name: obi-repro-app
+    environment:
+      LISTEN_PORT: "8080"
+      UPSTREAM_HOST: "upstream"
+      UPSTREAM_PORT: "8443"
+      # asyncio = memory-BIO TLS (reproduces the bug)
+      # blocking = socket-BIO TLS (control arm, attributed correctly)
+      CLIENT_MODE: "${CLIENT_MODE:-asyncio}"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - upstream
+
+  loadgen:
+    build: ./loadgen
+    container_name: obi-repro-loadgen
+    environment:
+      TARGET_HOST: "app"
+      TARGET_PORT: "8080"
+      # The bug does NOT reproduce at CONCURRENCY=1. See README.
+      CONCURRENCY: "${CONCURRENCY:-150}"
+      DURATION_S: "${DURATION_S:-0}"
+    depends_on:
+      - app
+
+  obi:
+    # OpenTelemetry eBPF Instrumentation. Swap for grafana/beyla:latest to test
+    # Beyla's vendored copy instead -- the BEYLA_* env vars are accepted there.
+    image: "${OBI_IMAGE:-otel/ebpf-instrument:latest}"
+    container_name: obi-repro-obi
+    privileged: true
+    # Share app's PID and network namespaces so OBI sees the target process and
+    # its sockets exactly as an agent co-located with the workload would.
+    pid: "service:app"
+    network_mode: "service:app"
+    environment:
+      OTEL_EBPF_OPEN_PORT: "8080"
+      OTEL_EBPF_SERVICE_NAME: "app"
+      OTEL_EBPF_TRACE_PRINTER: "json"
+      OTEL_EBPF_LOG_LEVEL: "${OBI_LOG_LEVEL:-info}"
+      # Set OBI_BPF_DEBUG=true to additionally get the raw SSL_write_ex /
+      # tcp_sendmsg eBPF log lines quoted in the issue.
+      OTEL_EBPF_BPF_DEBUG: "${OBI_BPF_DEBUG:-false}"
+      # Beyla-prefixed aliases, harmless for OBI, used when OBI_IMAGE=grafana/beyla.
+      BEYLA_OPEN_PORT: "8080"
+      BEYLA_SERVICE_NAME: "app"
+      BEYLA_TRACE_PRINTER: "json"
+      BEYLA_BPF_DEBUG: "${OBI_BPF_DEBUG:-false}"
+    volumes:
+      - /sys/kernel/security:/sys/kernel/security
+      - /sys/fs/cgroup:/sys/fs/cgroup
+    depends_on:
+      - app
