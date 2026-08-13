@@ -1,0 +1,16 @@
+# Node.js arm.
+#
+# Overlays the base stack, replacing the CPython `app` service with the
+# functionally identical Node one. Everything else -- upstream, loadgen, and the
+# OBI container sharing app's PID and network namespaces -- is unchanged, so the
+# two runtimes are measured the same way and check.py needs no changes.
+#
+# Run:
+#   docker compose -f docker-compose.yml -f docker-compose.node.yml up --build
+#   docker logs obi-repro-obi 2>&1 | python3 check.py
+#
+# CLIENT_MODE has no effect here: Node's TLS client is always memory-BIO.
+
+services:
+  app:
+    build: ./app-node

@@ -13,6 +13,13 @@ The whole point of this file is HOW the outbound TLS call is made.
       kernel socket LATER, by the event loop, on a different call stack than
       the SSL_write that produced it.
 
+  CLIENT_MODE=asyncio-pooled
+      Same memory-BIO client as `asyncio`, but over a fixed pool of persistent
+      TLS connections instead of a fresh one per request. This is the shape of
+      the original real-world symptom: a long-lived pooled connection to a
+      datastore. One handshake per pooled connection, then thousands of
+      application-data records over it.
+
   CLIENT_MODE=blocking (control arm, does NOT reproduce the bug)
       A plain blocking socket + ctx.wrap_socket() in a thread executor. This is
       a *socket BIO*: OpenSSL calls write(2) on the real fd from inside
@@ -34,6 +41,7 @@ LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
 UPSTREAM_HOST = os.environ.get("UPSTREAM_HOST", "upstream")
 UPSTREAM_PORT = int(os.environ.get("UPSTREAM_PORT", "8443"))
 CLIENT_MODE = os.environ.get("CLIENT_MODE", "asyncio").strip().lower()
+UPSTREAM_POOL_SIZE = int(os.environ.get("UPSTREAM_POOL_SIZE", "16"))
 
 # The upstream cert is self-signed and generated at image build time. Verifying
 # it would require sharing the cert between two images and adds nothing to the
@@ -52,7 +60,58 @@ _REQ = (
     "\r\n"
 ).encode()
 
+# Same request, minus "Connection: close", so the upstream keeps the
+# connection open and it can go back in the pool.
+_REQ_KEEPALIVE = (
+    "GET /upstream HTTP/1.1\r\n"
+    f"Host: {UPSTREAM_HOST}\r\n"
+    "Accept: application/json\r\n"
+    "User-Agent: app-outbound/1.0\r\n"
+    "\r\n"
+).encode()
+
 _stats = {"inbound": 0, "outbound_ok": 0, "outbound_err": 0}
+
+# Each slot holds either a live (reader, writer) pair or None, meaning "this
+# slot needs a fresh connection". Bounding the pool is what makes the
+# connections long-lived: the same handful is reused for the whole run.
+_POOL: "asyncio.Queue | None" = None
+
+
+async def _read_one_response(reader) -> int:
+    head = await reader.readuntil(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1])
+    body = await reader.readexactly(length) if length else b""
+    return len(head) + len(body)
+
+
+async def call_upstream_pooled() -> int:
+    """Memory-BIO TLS over a persistent pooled connection."""
+    slot = await _POOL.get()
+    writer = None
+    try:
+        if slot is None:
+            reader, writer = await asyncio.open_connection(
+                UPSTREAM_HOST, UPSTREAM_PORT, ssl=_TLS
+            )
+        else:
+            reader, writer = slot
+        writer.write(_REQ_KEEPALIVE)
+        await writer.drain()
+        n = await _read_one_response(reader)
+        _POOL.put_nowait((reader, writer))
+        return n
+    except Exception:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+        _POOL.put_nowait(None)
+        raise
 
 
 async def call_upstream_asyncio() -> int:
@@ -91,7 +150,11 @@ async def call_upstream_blocking() -> int:
     return await asyncio.get_running_loop().run_in_executor(None, _blocking_call)
 
 
-CALL = call_upstream_asyncio if CLIENT_MODE == "asyncio" else call_upstream_blocking
+_MODES = {
+    "asyncio": lambda: call_upstream_asyncio,
+    "asyncio-pooled": lambda: call_upstream_pooled,
+    "blocking": lambda: call_upstream_blocking,
+}
 
 
 async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -125,7 +188,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         status = "200 OK"
     else:
         try:
-            n = await CALL()
+            n = await _MODES[CLIENT_MODE]()()
             _stats["outbound_ok"] += 1
             body = b'{"ok":true,"upstream_bytes":%d}\n' % n
             status = "200 OK"
@@ -152,12 +215,19 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
 
 
 async def main():
-    if CLIENT_MODE not in ("asyncio", "blocking"):
-        print("CLIENT_MODE must be 'asyncio' or 'blocking'", file=sys.stderr)
+    global _POOL
+    if CLIENT_MODE not in _MODES:
+        print("CLIENT_MODE must be one of %s" % ", ".join(sorted(_MODES)),
+              file=sys.stderr)
         raise SystemExit(2)
+    if CLIENT_MODE == "asyncio-pooled":
+        _POOL = asyncio.Queue()
+        for _ in range(UPSTREAM_POOL_SIZE):
+            _POOL.put_nowait(None)
     server = await asyncio.start_server(handle, "0.0.0.0", LISTEN_PORT, backlog=512)
-    print("app listening on http://0.0.0.0:%d  CLIENT_MODE=%s  upstream=%s:%d"
-          % (LISTEN_PORT, CLIENT_MODE, UPSTREAM_HOST, UPSTREAM_PORT), flush=True)
+    print("app listening on http://0.0.0.0:%d  CLIENT_MODE=%s  upstream=%s:%d  pool=%d"
+          % (LISTEN_PORT, CLIENT_MODE, UPSTREAM_HOST, UPSTREAM_PORT,
+             UPSTREAM_POOL_SIZE if CLIENT_MODE == "asyncio-pooled" else 0), flush=True)
     async with server:
         await server.serve_forever()
 

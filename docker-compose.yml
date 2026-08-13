@@ -23,9 +23,13 @@ services:
       LISTEN_PORT: "8080"
       UPSTREAM_HOST: "upstream"
       UPSTREAM_PORT: "8443"
-      # asyncio = memory-BIO TLS (reproduces the bug)
-      # blocking = socket-BIO TLS (control arm, attributed correctly)
+      # asyncio        = memory-BIO TLS, new connection per request (reproduces)
+      # asyncio-pooled  = memory-BIO TLS over persistent pooled connections
+      # blocking        = socket-BIO TLS (control arm, attributed correctly)
       CLIENT_MODE: "${CLIENT_MODE:-asyncio}"
+      # Node equivalent of asyncio-pooled; ignored by the CPython app.
+      UPSTREAM_KEEPALIVE: "${UPSTREAM_KEEPALIVE:-false}"
+      UPSTREAM_POOL_SIZE: "${UPSTREAM_POOL_SIZE:-16}"
     ports:
       - "8080:8080"
     depends_on:

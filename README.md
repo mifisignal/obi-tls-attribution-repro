@@ -30,6 +30,7 @@ inbound caller.
 |---|---|
 | `upstream` | A TLS server on `:8443` with a self-signed cert built into the image. It is the only correct peer for any outbound call here. |
 | `app` | A CPython `asyncio` service. It serves plain HTTP on `:8080`, and makes one outbound TLS call to `upstream:8443` for each inbound request. |
+| `app` (Node arm) | A Node.js service that does the same job, selected with a compose overlay. Node's TLS client is `TLSWrap`, which is also a memory BIO. |
 | `loadgen` | Sends concurrent requests to `app`. |
 | `obi` | The instrumentation being tested. It prints spans as JSON to stdout. |
 
@@ -53,6 +54,49 @@ To test Grafana Beyla's vendored copy of OBI:
 ```sh
 OBI_IMAGE=grafana/beyla:3.32.0 docker compose up --build -d
 ```
+
+## The Node arm
+
+The stack can run a Node.js service in place of the CPython one. Node uses its
+own bundled OpenSSL, and its TLS client is `TLSWrap`, which is also a memory
+BIO. It shows the same fault, and in these runs it showed it more strongly.
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.node.yml up --build -d
+sleep 90
+docker logs obi-repro-obi 2>&1 | python3 check.py
+```
+
+The overlay only swaps the build for the `app` service. Everything else stays
+the same, so `check.py` needs no changes. `CLIENT_MODE` does nothing in this
+arm, because Node has no socket-BIO client to switch to.
+
+Node links OpenSSL statically into the `node` binary. On `node:24-slim` there is
+no `libssl.so` and no `libcrypto.so` at all. `BIO_write`, `BIO_read`,
+`SSL_set_bio` and `SSL_write` are exported from the executable itself, so
+anything that looks only at shared libraries will find nothing.
+
+## Pooled connections
+
+By default each inbound request opens a new outbound TLS connection. Both arms
+can instead reuse a small pool of long lived connections. That is closer to how
+a service usually talks to a database or a cache, and it means one TLS handshake
+at the start followed by thousands of application records.
+
+```sh
+UPSTREAM_KEEPALIVE=true docker compose -f docker-compose.yml -f docker-compose.node.yml up --build -d   # Node
+CLIENT_MODE=asyncio-pooled docker compose up --build -d                                                 # CPython
+```
+
+`UPSTREAM_POOL_SIZE` sets the pool size and defaults to 16. You can tell the
+pool is working from `check.py` output: the `DNS` span count drops to roughly
+the pool size, instead of tracking the request count.
+
+The two arms behave differently once pooled. The Node pooled arm still
+reproduces the fault. The CPython pooled arm did not reproduce it in these runs,
+so do not use it as a check. With a stable pool the first connection the thread
+touches is the outbound one, the guess lands on it, and the guess is then kept
+for the life of the connection.
 
 ## What to look for
 
@@ -122,17 +166,23 @@ correct.
 This means a test that sends one request at a time will pass while the bug is
 still there. The default here is `CONCURRENCY=150`.
 
+This applies to the Node arm as well. Node runs one event loop, so the same
+condition is needed: an inbound request in flight at the moment the outbound
+ciphertext reaches the socket.
+
 ## Test results
 
-Four runs, changing the TLS stack and the concurrency level. Every row below
-was measured. None are estimates.
+Six runs, changing the app, the TLS stack and the concurrency level. Every row
+below was measured. None are estimates.
 
-| `CLIENT_MODE` | `CONCURRENCY` | Instrumentation | Client spans | Wrong |
+| App and TLS client | `CONCURRENCY` | Instrumentation | Client spans | Wrong |
 |---|---|---|---|---|
-| `asyncio` (memory BIO) | 150 | `otel/ebpf-instrument:latest` (v0.10.0) | 45,721 | 5,336 (11.7%), all reversed |
-| `asyncio` (memory BIO) | 150 | `grafana/beyla:3.32.0` | 27,568 | 3,090 (11.2%), all reversed |
-| `asyncio` (memory BIO) | 1 | `otel/ebpf-instrument:latest` | 62,898 | 0 |
-| `blocking` (socket BIO) | 150 | `otel/ebpf-instrument:latest` | 90,987 | 0 |
+| CPython `asyncio` (memory BIO) | 150 | `otel/ebpf-instrument:latest` (v0.10.0) | 45,721 | 5,336 (11.7%), all reversed |
+| CPython `asyncio` (memory BIO) | 150 | `grafana/beyla:3.32.0` | 27,568 | 3,090 (11.2%), all reversed |
+| CPython `asyncio` (memory BIO) | 1 | `otel/ebpf-instrument:latest` | 62,898 | 0 |
+| CPython `blocking` (socket BIO) | 150 | `otel/ebpf-instrument:latest` | 90,987 | 0 |
+| Node `https` (memory BIO) | 150 | `otel/ebpf-instrument:latest` | 29,056 | 23,234 (80.0%), all reversed |
+| Node `https` pooled (memory BIO) | 150 | `otel/ebpf-instrument:latest` | 38,698 | 9,723 (25.1%), all reversed |
 
 The error rate moves around between runs. Repeats of the first row on the same
 machine came out anywhere from 2.8% to 11.7%. That is expected for a race that
@@ -141,7 +191,10 @@ non-zero count as a reproduction, and do not read the percentage as a measure
 of how bad the bug is. The two zero rows were zero every time, over tens of
 thousands of spans each.
 
-Those last two rows are the controls. Dropping concurrency to 1 makes the fault
+The Node arm is worse than the CPython one, by a lot. The same caveat about
+variance applies to it.
+
+Those two zero rows above are the controls. Dropping concurrency to 1 makes the fault
 go away. So does keeping the same concurrency and switching the same
 application to a blocking socket-BIO TLS client, which is what
 `CLIENT_MODE=blocking` does. That mode uses `socket` plus `ctx.wrap_socket()` in
@@ -153,6 +206,25 @@ stack.
 CONCURRENCY=1 docker compose up --build -d               # no repro
 CLIENT_MODE=blocking docker compose up --build -d        # no repro
 ```
+
+### With a candidate fix
+
+There is a candidate fix that correlates the `SSL*` to its socket by matching
+the leading bytes of the TLS record, rather than guessing from thread activity.
+It is not part of this repository. These are the same arms as above, measured on
+the same machine, with that fix in place.
+
+| App and TLS client | Stock | With the fix |
+|---|---|---|
+| CPython `asyncio` | 9.6% wrong | 0 |
+| Node `https` | 80.0% wrong | 0 |
+| Node `https` pooled | 25.1% wrong | 0 |
+
+Read those zeros the same way as the zero rows above, and no more strongly. One
+earlier CPython run under the fix left 3 wrong spans out of 40,724, which is
+0.007% and not a clean zero. The fix also does nothing for a connection that was
+already open before the instrumentation attached, because the setup call it
+depends on has already happened by then.
 
 ## Environment
 
